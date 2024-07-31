@@ -1,9 +1,21 @@
+def warn(*args, **kwargs):
+    pass
+import warnings
+warnings.warn = warn
+
 import nhpp
 import numpy as np 
-import pandas as pd
 from copy import deepcopy
-from pickle import loads, dumps
+from pickle import loads, dumps, load, dump
 import matplotlib.pyplot as plt
+import pandas as pd
+import csv
+import pmdarima as pm
+import collections
+
+# use time series to predict future arrival rates
+
+# try doubly stochastic poisson process
 
 class Doctor:
 
@@ -178,7 +190,7 @@ class Hospital:
             patience, 
             triage_probabilities, 
             triage_probabilities_crisis,
-            weekly_crisis_factor,
+            daily_crisis_factor,
             threshold, 
             days, 
             patients,
@@ -192,13 +204,14 @@ class Hospital:
         self.patience = patience
         self.triage_probabilities = triage_probabilities
         self.triage_probabilities_crisis = triage_probabilities_crisis
-        self.weekly_crisis_factor = weekly_crisis_factor
+        self.daily_crisis_factor = daily_crisis_factor
         self.patients = patients
         self.n = len(self.patients)
         self.threshold = threshold
         self.days = days
         self.hosp_number = hosp_number
         self.doctors, self.prev_shift_start_20 = generate_doctors(start=0, doctor_shift_counts=self.doctor_shift_counts)
+        self.patient_arrival_counts = get_patient_arrival_counts(self.patients)
 
         self.dummy = Patient(np.inf, 5, self.service_rate, self.patience)
         self.patients_queue = TriageQueue(self.patients, self.dummy)
@@ -222,7 +235,7 @@ class Hospital:
         patients = loads(dumps(patients_in_queue, -1))
         n_in_queue = len(patients)
         patients += generate_patients(self.hourly_arrival_rates[shift_start:next_shift_start + 1], self.service_rate, self.patience, 
-                                      self.triage_probabilities, self.triage_probabilities_crisis, self.weekly_crisis_factor, 
+                                      self.triage_probabilities, self.triage_probabilities_crisis, self.daily_crisis_factor, 
                                       shift_start=shift_start, hosp_number=hosp_number) # one shift
         if diverted_patients: self.insort_diverted(diverted_patients, patients, travel_time)
         # doctors_queue = deepcopy(self.doctors_queue)
@@ -244,12 +257,14 @@ class Hospital:
             doctor_shift_counts,
             diverted_patients=None, 
             travel_time=1./60., 
-            hosp_number=1
+            hosp_number=1,
+            predicted_arrival_counts=None
             ):
+        if predicted_arrival_counts is None: predicted_arrival_counts = self.hourly_arrival_rates[shift_start:]
         patients = loads(dumps(patients_in_queue, -1))
         n_in_queue = len(patients)
-        patients += generate_patients(self.hourly_arrival_rates[shift_start:], self.service_rate, self.patience, 
-                                      self.triage_probabilities, self.triage_probabilities_crisis, self.weekly_crisis_factor, 
+        patients += generate_patients(predicted_arrival_counts, self.service_rate, self.patience, 
+                                      self.triage_probabilities, self.triage_probabilities_crisis, self.daily_crisis_factor, 
                                       shift_start=shift_start, hosp_number=hosp_number) # one shift
         if diverted_patients: self.insort_diverted(diverted_patients, patients, travel_time)
         doctors_queue = loads(dumps(self.doctors_queue, -1))
@@ -363,24 +378,43 @@ class Hospital:
         print([np.mean([1 if p.assigned_doctor else 0 for p in self.patients[1000:-1000] if p.triage == t and not p.diverted]) for t in range(1, 6)])
 
 
-def simulate_system_by_shift(hosp1, hosp2, days, reps=10, thresholds_to_test=[0, 25, 50, 75, 100, 125, 150, 175, 200], show_output=True, simulate_one_step_ahead=True):
+def simulate_system_by_shift(hosp1, hosp2, days, reps=30, thresholds_to_test=[0, 25, 50, 75, 100, 125, 150, 175, 200], 
+                             show_output=True, simulate_one_step_ahead=True, travel_time=1./60., threshold_model=None,
+                             previous_patient_counts_hosp1=None, previous_patient_counts_hosp2=None):
     '''Hospital 2 receives Hospital 1's diverted patients'''
 
     res = np.zeros((days, 6))
     all_thresholds = np.repeat(hosp1.threshold, 6)
     nt = len(thresholds_to_test)
+
+    if previous_patient_counts_hosp1 is not None:
+        data_hosp1 = previous_patient_counts_hosp1 + hosp1.patient_arrival_counts
+        data_hosp2 = previous_patient_counts_hosp2 + hosp2.patient_arrival_counts
+
+    if threshold_model: 
+        # first are doctor shift counts then patient arrival counts and threshold value on D days prior
+        features = np.array([hosp2.doctor_shift_counts + [0 for _ in range(18)]])
+        features[0, np.arange(8, 24, 3)] = hosp1.threshold
+
     for d in range(days):
-        if d % 7 == 0 and show_output: print('Week:', d // 7)
+        # if d % 7 == 0 and show_output: print('Week:', d // 7)
+        if show_output: print('Day:', d)
         daily_shifts = [4*i + 24*d for i in range(6)]
         for j, shift_start in enumerate(daily_shifts):
             next_shift_start = shift_start + 4
             
             # simulate for best threshold 
-            if simulate_one_step_ahead:
+            if simulate_one_step_ahead and not threshold_model:
+                
+                pred_arrival_rate_hosp1 = fit_predict(data_hosp1[shift_start:-24 * days + shift_start], timesteps=24 * days - shift_start)
+                pred_arrival_rate_hosp1[pred_arrival_rate_hosp1 < 0.] = 0.
+                pred_arrival_rate_hosp2 = fit_predict(data_hosp2[shift_start:-24 * days + shift_start], timesteps=24 * days - shift_start)
+                pred_arrival_rate_hosp2[pred_arrival_rate_hosp2 < 0.] = 0.
+
                 mortality_rate = np.zeros(nt)
                 patients_currently_in_queue1 = [p for p in hosp1.patients if p.in_queue and p.arrival_time < shift_start]
                 patients_currently_in_queue2 = [p for p in hosp2.patients if p.in_queue and p.arrival_time < shift_start]
-                print(len(patients_currently_in_queue1), len(patients_currently_in_queue2), end=' ')
+                if show_output: print(len(patients_currently_in_queue1), len(patients_currently_in_queue2), end=' ')
 
                 remaining_shifts = daily_shifts[j:]
                 remaining_days = [di for di in range(d + 1, days)]
@@ -392,18 +426,37 @@ def simulate_system_by_shift(hosp1, hosp2, days, reps=10, thresholds_to_test=[0,
 
                         # hosp1_patients, diverted_patients = hosp1.sample_one_shift_ahead(patients_currently_in_queue1, shift_start, next_shift_start, threshold)
                         hosp1_patients = hosp1.sample_till_end(patients_currently_in_queue1, doctors1, shift_start, remaining_shifts, remaining_days,
-                                                               threshold, prev_shift_start_20_1, hosp1.doctor_shift_counts)
+                                                               threshold, prev_shift_start_20_1, hosp1.doctor_shift_counts, travel_time=travel_time,
+                                                               predicted_arrival_counts=pred_arrival_rate_hosp1)
                         diverted_patients = [p for p in hosp1_patients if p.diverted]
                         # hosp2_patients, _ = hosp2.sample_one_shift_ahead(patients_currently_in_queue2, shift_start, next_shift_start, np.inf, diverted_patients, hosp_number=2)
-                        hosp2_patients = hosp2.sample_till_end(patients_currently_in_queue2, doctors2, shift_start, remaining_shifts, remaining_days,
-                                                               np.inf, prev_shift_start_20_2, hosp2.doctor_shift_counts, diverted_patients)
+                        hosp2_patients = hosp2.sample_till_end(patients_currently_in_queue2, doctors2, shift_start, remaining_shifts, remaining_days, np.inf, 
+                                                               prev_shift_start_20_2, hosp2.doctor_shift_counts, diverted_patients, travel_time=travel_time, 
+                                                               hosp_number=2, predicted_arrival_counts=pred_arrival_rate_hosp2)
                         # mortality_rate[i] += np.mean([p.dies() for p in hosp1_patients if not p.diverted] + [p.dies() for p in hosp2_patients]) / reps
                         mortality_rate[i] += np.mean([p.wait_time - p.death_time >= -1e-8 for p in hosp1_patients if not p.diverted] + 
                                                      [p.wait_time - p.death_time >= -1e-8 for p in hosp2_patients]) / reps
                 best_threshold = thresholds_to_test[np.argmin(mortality_rate)]
                 # all_thresholds[j] += (best_threshold - all_thresholds[j]) / (j + d*6 + 1)
-                print(np.round(mortality_rate, 3))
+                if show_output: print(np.round(mortality_rate, 3))
                 all_thresholds[j] = best_threshold
+
+            elif threshold_model and (j > 0 or d >=1):
+                # Shift the patient arrival counts
+                features[0, np.arange(6 + 3, 24, 3)] = features[0, np.arange(6, 24 - 3, 3)]
+                features[0, np.arange(7 + 3, 24, 3)] = features[0, np.arange(7, 24 - 3, 3)]
+                
+                # Update patients arriving in previous shift
+                features[0, 6] = hosp1.patients_queue.n_arrived - features[0, 6 + 3]
+                features[0, 7] = hosp2.patients_queue.n_arrived - features[0, 7 + 3]
+
+                # if it is day 2 there is enough data to predict
+                if d >= 1:
+                    # Predict new threshold
+                    all_thresholds[j] = threshold_model.predict(features)
+                    # Shift the threshold values and update the previous shift threshold
+                    features[0, np.arange(8 + 3, 24, 3)] = features[0, np.arange(8, 24 - 3, 3)]
+                    features[0, 8] = all_thresholds[j]
 
             for doctor in hosp1.doctors[shift_start]:
                 hosp1.doctors_queue.append(doctor)
@@ -413,7 +466,7 @@ def simulate_system_by_shift(hosp1, hosp2, days, reps=10, thresholds_to_test=[0,
 
             diverted_patients = hosp1.simulate_one_shift(next_shift_start, hosp1.patients, hosp1.doctors_queue, hosp1.patients_queue, all_thresholds[j], hosp1.hosp_number)
             # diverted_patients = [p for p in hosp1.patients if p.diverted and p.arrival_time >= shift_start and p.arrival_time < next_shift_start]
-            hosp2.insort_diverted(diverted_patients, in_triage_queue=True, travel_time=1./60.)
+            hosp2.insort_diverted(diverted_patients, in_triage_queue=True, travel_time=travel_time)
             hosp2.simulate_one_shift(next_shift_start, hosp2.patients, hosp2.doctors_queue, hosp2.patients_queue, hosp2.threshold, hosp2.hosp_number)
 
         hosp1.doctors, hosp1.prev_shift_start_20 = generate_doctors(start=24*(d+1), prev_shift_start_20=hosp1.prev_shift_start_20, doctor_shift_counts=hosp1.doctor_shift_counts)
@@ -428,17 +481,23 @@ def generate_patients(
         service_rate, patience, 
         triage_probabilities, 
         triage_probabilities_crisis, 
-        weekly_crisis_factor, 
+        daily_crisis_factor, 
         shift_start=0, 
-        hosp_number=1
+        hosp_number=1,
+        ambulance_proportions=[0.6, 0.4]
         ):
     knots = {i + shift_start: h for i, h in enumerate(hourly_arrival_rates)}
     arrival_times = nhpp.get_arrivals(knots)
-    n = len(arrival_times)
-    by_ambulance = np.random.choice([False, True], size=n, p=[0.75, 0.25])
+    n = len(arrival_times)  
+    by_ambulance = np.random.choice([False, True], size=n, p=ambulance_proportions)
     # triage = np.array([t for i, t in enumerate(np.random.choice([1, 2, 3, 4, 5], size=n, p=triage_probabilities))])
-    triage = np.array([compute_triage(arrival_time, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor) 
+    triage = np.array([compute_triage(arrival_time, triage_probabilities, triage_probabilities_crisis, daily_crisis_factor) 
                        for arrival_time in arrival_times])
+    
+    # ambulance_probabilities = triage_probabilities[:2]
+    # ambulance_probabilities = [a / sum(ambulance_probabilities) for a in ambulance_probabilities]
+    # triage = np.array([t if not by_ambulance[i] else np.random.choice([1, 2], size=1, p=ambulance_probabilities)[0]
+    #                    for i, t in enumerate(np.random.choice([1, 2, 3, 4, 5], size=n, p=triage_probabilities))])
     
     return [Patient(a, t, service_rate, patience, b, hosp_number=hosp_number) for a, t, b in zip(arrival_times, triage, by_ambulance)]
 
@@ -465,6 +524,34 @@ def inverse_mortality_func(u, a, t, B, nu, K={1:1.,2:0.9,3:.05,4:.02,5:.01}, A={
     elif u >= K[t]: return np.inf
     return -np.log((((K[t] - A[t]) / (u - A[t])) ** (nu+0.25*t) - 1.) / (3.*t)) / (B+5.-t) + (-2.+2.5*a)*t/(B+5.-t)
 
+def compute_triage(arrival_time, triage_probabilities, triage_probabilities_crisis, daily_crisis_factor):
+    day = int(arrival_time // 24)
+    if daily_crisis_factor[day] > 1:
+        return np.random.choice([1, 2, 3, 4, 5], size=1, p=triage_probabilities_crisis)[0]
+    else:
+        return np.random.choice([1, 2, 3, 4, 5], size=1, p=triage_probabilities)[0]
+    
+def get_patient_arrival_counts(patients):
+    counts = collections.Counter([p.arrival_time // 1 for p in patients])
+    return [counts[i] for i in range(int(max(counts.keys())) + 1)]
+
+def fit_predict(data, timesteps, max_dur=5):
+    # Fit the SARIMA model with more appropriate parameters
+    with pm.StepwiseContext(max_dur=max_dur):  # Increase max_dur for a more thorough search
+        model = pm.auto_arima(data,
+                            start_p=1, start_q=1,
+                            max_p=3, max_q=3,
+                            m=24,  # Daily seasonality
+                            start_P=0, start_Q=0,
+                            max_P=2, max_Q=2,
+                            seasonal=True,
+                            d=1, D=1,  # Differencing
+                            trace=True,
+                            error_action='ignore',
+                            suppress_warnings=True,
+                            stepwise=True)
+    return model.predict(timesteps)
+
 def plot_mortality(save=True):
     plt.rcParams['figure.figsize'] = (15, 4)
     x = np.linspace(0, 6, 1000)
@@ -478,18 +565,18 @@ def plot_mortality(save=True):
     plt.xlabel('Death time (hours)')
     plt.ylabel('Probability')
     plt.legend(loc='upper right')
-    if save: plt.savefig('mortality.png', bbox_inches='tight')
+    if save: plt.savefig('mortality.pdf', bbox_inches='tight')
     plt.show()
 
 def plot_arrival_rate(hourly_arrival_rates_, save=False):
-    plt.rcParams["figure.figsize"] = (15, 5)
+    plt.rcParams["figure.figsize"] = (15, 2)
     data = hourly_arrival_rates_
     n = len(data)
     plt.plot(data)
     plt.xlabel('Day')
     plt.ylabel('Arrival Rate')
-    if save: plt.savefig('arrival_rate.png', bbox_inches='tight')
     plt.xticks(np.arange(0,n+1,24), labels=np.arange(0, n//24 + 1))
+    if save: plt.savefig('arrival_rate.pdf', bbox_inches='tight')
     plt.show()
 
 def plot_predicted(model, data, periods=24*7):
@@ -514,64 +601,40 @@ def plot_predicted(model, data, periods=24*7):
     plt.title("Arrival rate forecast")
     plt.show()
 
-def compute_triage(arrival_time, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor):
-    week = int(arrival_time // (7*24))
-    if weekly_crisis_factor[week] > 1.:
-        return np.random.choice([1, 2, 3, 4, 5], size=1, p=triage_probabilities_crisis)[0]
-    else:
-        return np.random.choice([1, 2, 3, 4, 5], size=1, p=triage_probabilities)[0]
-    
-def single_threshold_simulation(
-        patients_hosp1,
-        patients_hosp2,
-        hourly_arrival_rates, 
-        service_rate, patience, 
-        triage_probabilities, 
-        triage_probabilities_crisis, 
-        weekly_crisis_factor, 
-        thresholds, 
-        reps,
-        days,
-        hosp2_doctor_shift_counts,
-        ):
-    
-    mortality_rates = [0. for _ in thresholds]
-    for i, threshold in enumerate(thresholds):
-        for k in range(reps):
-            if reps == 1:
-                patients_hosp1_c, patients_hosp2_c = loads(dumps(patients_hosp1, -1)), loads(dumps(patients_hosp2, -1))
-            else:
-                patients_hosp1_c = generate_patients(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, hosp_number=1)
-                patients_hosp2_c = generate_patients(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, hosp_number=2)
-            
-            hosp1 = Hospital(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, threshold, days, patients_hosp1_c, hosp_number=1)
-            hosp2 = Hospital(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, np.inf, days, patients_hosp2_c, doctor_shift_counts=hosp2_doctor_shift_counts, hosp_number=2)
-            simulate_system_by_shift(hosp1, hosp2, days, show_output=False, simulate_one_step_ahead=False)
-            mortality_rates[i] += np.mean([p.wait_time - p.death_time >= -1e-8 for p in hosp1.patients[100:-100] if not p.diverted] +
-                                            [p.wait_time - p.death_time >= -1e-8 for p in hosp2.patients[100:-100]]) / reps
-        print('Threshold:', threshold, '---', 'Mortality rate:', np.round(mortality_rates[i], 4))
+def elementswise_left_join(l1, l2):
+    f_len = len(l1) - (len(l2) - 1)
+    for i in range(0, len(l2), 1):
+        if f_len - i >= len(l1):
+            break
+        else:
+            l1[i] = l1[i] + l2[i]
+    return l1
 
-    plt.plot(thresholds, mortality_rates)
-    plt.xlabel('Thresholds')
-    plt.ylabel('Mortality rate')
-    plt.savefig('mortality_rates_thresholds.png', bbox_inches='tight')
+def plot_arrival_overlay_lives(hourly_arrival_rates, static_death_counts_h1, static_death_counts_h2, surrogate_death_counts_h1, surrogate_death_counts_h2):
+
+    dead_counts_static = elementswise_left_join(static_death_counts_h1, static_death_counts_h2) + [0] * 5
+    dead_counts_metamodel = elementswise_left_join(surrogate_death_counts_h1, surrogate_death_counts_h2) + [0] * 5
+    relative_difference_static = np.array(dead_counts_static) - np.array(dead_counts_metamodel)
+
+    fig, ax1 = plt.subplots(figsize=(15, 2))
+    ax2 = ax1.twinx()
+
+    width = 1.
+    # ax2.bar(np.arange(len(dead_counts_adaptive)), dead_counts_adaptive, label='Adaptive', width=width)
+    # ax2.axhline(0, linestyle='--', alpha=0.25, color='k')
+    ax2.bar([i for i in np.arange(len(dead_counts_static))], np.cumsum(relative_difference_static), width=width, label='Static Policy', edgecolor='darkblue', color='lightblue')
+    # ax2.bar([i for i in np.arange(len(dead_counts_metamodel))], np.cumsum(relative_difference_adaptive), label='Adaptive Policy', width=width, color='lightblue', edgecolor='darkblue')
+    ax2.set_ylabel('Cumulative Lives Saved', color='darkblue')
+    ax2.tick_params(axis='y', colors='darkblue')
+    ax2.set_axisbelow(True)
+    ax2.set_ylim([0, 14])
+    # ax2.legend()
+
+    har = np.array(hourly_arrival_rates)
+
+    ax1.set_ylabel('Arrival Rate')
+    ax1.set_xlabel('Hour')
+    ax2.plot((har * 14 / 36 - 0)[0][:-1], label='Arrival Rate', color='k')
+    ax1.set_ylim([0, 36])
+
     plt.show()
-
-def varying_threshold_simulation(
-        hourly_arrival_rates, 
-        service_rate, 
-        patience, 
-        triage_probabilities, 
-        triage_probabilities_crisis, 
-        weekly_crisis_factor, days, 
-        patients_hosp1, 
-        patients_hosp2, 
-        hosp2_doctor_shift_counts
-        ):
-    hosp1 = Hospital(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, np.inf, days, patients_hosp1, hosp_number=1)
-    hosp2 = Hospital(hourly_arrival_rates, service_rate, patience, triage_probabilities, triage_probabilities_crisis, weekly_crisis_factor, np.inf, days, patients_hosp2, doctor_shift_counts=hosp2_doctor_shift_counts, hosp_number=2)
-    optimal_thresholds = simulate_system_by_shift(hosp1, hosp2, days, show_output=True)
-    print(np.mean([p.wait_time - p.death_time >= -1e-8 for p in hosp1.patients[100:-100] if not p.diverted] + 
-                    [p.wait_time - p.death_time >= -1e-8 for p in hosp2.patients[100:-100]]))
-    plt.rcParams['figure.figsize'] = (20, 5)
-    plt.xlabel('Shift'); plt.ylabel('Threshold'); plt.plot(optimal_thresholds.ravel()); plt.savefig('varying_thresholds.png', bbox_inches='tight')
